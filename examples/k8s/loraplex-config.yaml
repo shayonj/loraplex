@@ -1,0 +1,34 @@
+listen: ":9090"
+vllm_url: "http://localhost:8000"
+
+vllm:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  max_loras: 200
+  max_lora_rank: 64
+
+storage:
+  dir: "/data/loraplex"
+  max_size: "200GB"
+
+origins:
+  - type: huggingface
+    token: "${HF_TOKEN}"
+  - type: s3
+    bucket: "company-adapters"
+    region: "us-east-1"
+
+invalidation:
+  ttl: "30m"
+
+discovery:
+  mode: k8s
+  k8s:
+    service: "loraplex-headless"
+    namespace: "inference"
+
+routing:
+  hash_on: "model"
+  vnodes_per_peer: 150
+  forward_timeout: "5s"
+  overflow_threshold: 0.8
+  fallback_to_base_model: false

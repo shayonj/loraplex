@@ -1,0 +1,194 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loraplex
+  namespace: inference
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: loraplex-endpoints-reader
+  namespace: inference
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: loraplex-endpoints-reader
+  namespace: inference
+subjects:
+  - kind: ServiceAccount
+    name: loraplex
+    namespace: inference
+roleRef:
+  kind: Role
+  name: loraplex-endpoints-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loraplex-headless
+  namespace: inference
+spec:
+  clusterIP: None
+  selector:
+    app: loraplex
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loraplex
+  namespace: inference
+spec:
+  selector:
+    app: loraplex
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loraplex-config
+  namespace: inference
+data:
+  config.yaml: |
+    listen: ":9090"
+    vllm_url: "http://localhost:8000"
+
+    vllm:
+      model_name: "meta-llama/Llama-3.1-8B-Instruct"
+      max_loras: 200
+      max_lora_rank: 64
+
+    storage:
+      dir: "/data/loraplex"
+      max_size: "200GB"
+
+    origins:
+      - type: huggingface
+        token: "${HF_TOKEN}"
+
+    invalidation:
+      ttl: "30m"
+
+    discovery:
+      mode: k8s
+      k8s:
+        service: "loraplex-headless"
+        namespace: "inference"
+
+    routing:
+      hash_on: "model"
+      vnodes_per_peer: 150
+      forward_timeout: "5s"
+      overflow_threshold: 0.8
+      fallback_to_base_model: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loraplex
+  namespace: inference
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loraplex
+  template:
+    metadata:
+      labels:
+        app: loraplex
+    spec:
+      serviceAccountName: loraplex
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          args:
+            - "--model"
+            - "meta-llama/Llama-3.1-8B-Instruct"
+            - "--enable-lora"
+            - "--max-loras"
+            - "200"
+            - "--max-lora-rank"
+            - "64"
+          env:
+            - name: VLLM_ALLOW_RUNTIME_LORA_UPDATING
+              value: "true"
+            - name: VLLM_PLUGINS
+              value: "lora_filesystem_resolver"
+            - name: VLLM_LORA_RESOLVER_CACHE_DIR
+              value: "/data/loraplex"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: adapter-storage
+              mountPath: /data/loraplex
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+
+        - name: loraplex
+          image: ghcr.io/shayonj/loraplex:latest
+          args: ["--config", "/etc/loraplex/config.yaml"]
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+          ports:
+            - containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loraplex
+            - name: adapter-storage
+              mountPath: /data/loraplex
+
+      volumes:
+        - name: config
+          configMap:
+            name: loraplex-config
+        - name: adapter-storage
+          emptyDir:
+            sizeLimit: 200Gi
