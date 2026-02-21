@@ -1,15 +1,16 @@
 bin/
 build/
+dist/
+loraplex
 *.exe
 
 coverage.out
 coverage.html
+combined.out
 
 key
 *.pem
 *.key
-
-dist/
 
 .DS_Store
 Thumbs.db

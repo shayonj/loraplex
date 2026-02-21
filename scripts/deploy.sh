@@ -14,8 +14,8 @@ scp bin/loraplex-linux-amd64 "$REMOTE_HOST:${REMOTE_DIR}/loraplex"
 scp config.example.yaml "$REMOTE_HOST:${REMOTE_DIR}/config.yaml"
 ssh "$REMOTE_HOST" "chmod +x ${REMOTE_DIR}/loraplex"
 
-echo "==> Creating cache dirs..."
-ssh "$REMOTE_HOST" "mkdir -p /dev/shm/loraplex /mnt/nvme/loraplex 2>/dev/null || mkdir -p /dev/shm/loraplex /tmp/loraplex_nvme"
+echo "==> Creating storage dir..."
+ssh "$REMOTE_HOST" "mkdir -p /mnt/nvme/loraplex"
 
 echo "==> Starting loraplex..."
 ssh "$REMOTE_HOST" "${REMOTE_DIR}/loraplex --config ${REMOTE_DIR}/config.yaml &"
