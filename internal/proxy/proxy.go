@@ -39,7 +39,7 @@ type ProxyConfig struct {
 func New(cfg ProxyConfig) *Proxy {
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-		TLSHandshakeTimeout:  10 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 300 * time.Second,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -65,7 +65,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if info.Model == "" || info.Model == p.baseModel {
+	isBaseModel := info.Model == "" || info.Model == p.baseModel
+
+	if isBaseModel && (p.hashOn == "model" || info.HashKey == "") {
 		p.proxyToVLLM(w, r, info.Body)
 		metrics.RecordRequest(info.Tenant, "passthrough", time.Since(start))
 		return
@@ -93,25 +95,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		metrics.RecordOverflow()
 	}
 
-	result, err := p.cacheMgr.EnsureAdapter(r.Context(), info.Model)
-	if err != nil {
-		slog.Error("ensure adapter failed", "adapter", info.Model, "err", err)
-		if p.fallbackBase {
-			p.proxyToVLLM(w, r, info.Body)
-			metrics.RecordRequest(info.Tenant, "fallback-base", time.Since(start))
+	if !isBaseModel {
+		result, err := p.cacheMgr.EnsureAdapter(r.Context(), info.Model)
+		if err != nil {
+			slog.Error("ensure adapter failed", "adapter", info.Model, "err", err)
+			if p.fallbackBase {
+				p.proxyToVLLM(w, r, info.Body)
+				metrics.RecordRequest(info.Tenant, "fallback-base", time.Since(start))
+				return
+			}
+			http.Error(w, fmt.Sprintf("adapter not available: %v", err), http.StatusServiceUnavailable)
 			return
 		}
-		http.Error(w, fmt.Sprintf("adapter not available: %v", err), http.StatusServiceUnavailable)
+
+		source := "origin"
+		if result.Cached {
+			source = "local"
+		}
+
+		p.proxyToVLLM(w, r, info.Body)
+		metrics.RecordRequest(info.Tenant, source, time.Since(start))
 		return
 	}
 
-	source := "origin"
-	if result.Cached {
-		source = "local"
-	}
-
 	p.proxyToVLLM(w, r, info.Body)
-	metrics.RecordRequest(info.Tenant, source, time.Since(start))
+	metrics.RecordRequest(info.Tenant, "routed", time.Since(start))
 }
 
 func (p *Proxy) proxyToVLLM(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -170,4 +178,3 @@ func (p *Proxy) proxyToVLLM(w http.ResponseWriter, r *http.Request, body []byte)
 	}
 	io.Copy(w, resp.Body)
 }
-

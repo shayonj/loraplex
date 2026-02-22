@@ -512,3 +512,108 @@ func TestOverflowHandledLocally(t *testing.T) {
 		t.Error("adapter should not be in node B's storage (overflow bypassed it)")
 	}
 }
+
+func TestBaseModelRoutedByHeader(t *testing.T) {
+	vllmA := NewMockVLLM()
+	vllmB := NewMockVLLM()
+	orig := NewMockOrigin()
+
+	muxA := http.NewServeMux()
+	muxB := http.NewServeMux()
+	srvA := httptest.NewUnstartedServer(muxA)
+	srvB := httptest.NewUnstartedServer(muxB)
+	srvA.Start()
+	srvB.Start()
+
+	addrA := strings.TrimPrefix(srvA.URL, "http://")
+	addrB := strings.TrimPrefix(srvB.URL, "http://")
+
+	makeNode := func(selfAddr string) *nodeEnv {
+		dir := t.TempDir()
+		mgr := cache.NewManager(
+			cache.NewStore(dir, 10<<20),
+			[]cache.OriginFetcher{origin.NewHTTP(orig.Server.URL)},
+			0,
+		)
+		mgr.Rebuild()
+		ring := routing.NewRing(100, selfAddr)
+		ring.Update([]string{addrA, addrB})
+		return &nodeEnv{ring: ring, cacheMgr: mgr, dir: dir, addr: selfAddr}
+	}
+
+	nA := makeNode(addrA)
+	nB := makeNode(addrB)
+
+	proxyA := proxy.New(proxy.ProxyConfig{
+		VLLMUrl:      vllmA.Server.URL,
+		BaseModel:    "base-model",
+		CacheManager: nA.cacheMgr,
+		Ring:         nA.ring,
+		Forwarder:    routing.NewForwarder(nA.ring, 5*time.Second, 0.8),
+		HashOn:       "header:X-Session-ID",
+	})
+	proxyB := proxy.New(proxy.ProxyConfig{
+		VLLMUrl:      vllmB.Server.URL,
+		BaseModel:    "base-model",
+		CacheManager: nB.cacheMgr,
+		Ring:         nB.ring,
+		Forwarder:    routing.NewForwarder(nB.ring, 5*time.Second, 0.8),
+		HashOn:       "header:X-Session-ID",
+	})
+
+	muxA.HandleFunc("/", proxyA.ServeHTTP)
+	muxB.HandleFunc("/", proxyB.ServeHTTP)
+	nA.server = srvA
+	nB.server = srvB
+
+	defer func() {
+		srvA.Close()
+		srvB.Close()
+		vllmA.Close()
+		vllmB.Close()
+		orig.Close()
+	}()
+
+	sessionID := ""
+	for i := 0; i < 10000; i++ {
+		key := fmt.Sprintf("session-%d", i)
+		if nA.ring.Owner(key).Addr == addrB {
+			sessionID = key
+			break
+		}
+	}
+	if sessionID == "" {
+		t.Fatal("could not find session ID that hashes to node B")
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "base-model",
+		"messages": []map[string]string{{"role": "user", "content": "Hello"}},
+	})
+	req, _ := http.NewRequest("POST", srvA.URL+"/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Session-ID", sessionID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	bSeen := vllmB.ModelsSeen()
+	aSeen := vllmA.ModelsSeen()
+	if bSeen["base-model"] != 1 {
+		t.Errorf("expected node B's vLLM to see 1 request, got %d", bSeen["base-model"])
+	}
+	if aSeen["base-model"] != 0 {
+		t.Errorf("expected node A's vLLM to see 0 requests (forwarded to B), got %d", aSeen["base-model"])
+	}
+
+	if orig.FetchCount() != 0 {
+		t.Errorf("base model request should not fetch from origin, got %d", orig.FetchCount())
+	}
+}

@@ -1,8 +1,8 @@
 # loraplex
 
-A managed adapter storage and routing layer for LoRA adapters on vLLM.
+A simple L7 proxy for vLLM that manages LoRA adapter storage via NVMe, routes requests, and pins workloads to nodes.
 
-loraplex sits between your clients and vLLM. It manages LoRA adapter files on disk so vLLM doesn't have to — fetching them on demand from HuggingFace, S3, or any HTTP origin, storing them in a size-bounded directory with LRU eviction, and using consistent hashing to route requests to the node that already has the adapter stored. Adapters can also arrive via the filesystem directly (training pipelines, rsync, NFS) and loraplex will detect and serve them. vLLM's `lora_filesystem_resolver` reads adapter files from the same directory loraplex writes to.
+loraplex sits between your clients and vLLM. It routes requests across a cluster using consistent hashing, manages LoRA adapter files on disk (fetching on demand from HuggingFace, S3, or HTTP, with LRU eviction), and provides node affinity through configurable hash keys. By default it hashes on the adapter name, but it can hash on any request header, enabling session pinning for prefix cache reuse, document-based routing for RAG workloads, or tenant isolation. vLLM's `lora_filesystem_resolver` reads adapter files from the same directory loraplex writes to.
 
 - [Quick Start](#quick-start)
   - [Install](#install)
@@ -150,6 +150,8 @@ vLLM (:8000)
   runs inference
 ```
 
+The diagram above shows the default behavior where `hash_on` is set to `model`. When `hash_on` uses a request header (e.g., `header:X-Session-ID`), the same consistent hashing applies to all requests including base model requests. No adapter files are fetched for base model requests, but the routing still pins the request to a deterministic node. This is useful for workloads where landing on the same vLLM instance matters, like multi-turn conversations that benefit from vLLM's prefix caching (`--enable-prefix-caching`) or RAG queries where the document context is already in a node's KV cache.
+
 ## API
 
 loraplex is a transparent OpenAI-compatible proxy. All vLLM endpoints pass through.
@@ -202,13 +204,15 @@ See the [`examples/`](examples/) directory for ready-to-use configs:
 | [`single-node.yaml`](examples/single-node.yaml)               | One loraplex + one vLLM, HuggingFace origin                               |
 | [`multi-node.yaml`](examples/multi-node.yaml)                 | 3-node cluster with static peer discovery                                 |
 | [`cache-only-sidecar.yaml`](examples/cache-only-sidecar.yaml) | Storage sidecar behind an external router (AIBrix, etc.) with S3 origin   |
+| [`session-affinity.yaml`](examples/session-affinity.yaml)     | Pin agent sessions to one node for prefix cache hits across turns         |
+| [`document-routing.yaml`](examples/document-routing.yaml)     | Route RAG queries by document so the context stays in one node's KV cache |
 | [`k8s/`](examples/k8s/)                                       | Full K8s deployment: RBAC, headless Service, Deployment with vLLM sidecar |
 
 ## Architecture Details
 
 ### Storage
 
-loraplex manages a single directory on disk. This is the directory vLLM's filesystem resolver reads from. Point it at your fastest available local storage — NVMe, tmpfs, or any local mount.
+loraplex manages a single directory on disk. This is the directory vLLM's filesystem resolver reads from. Point it at your fastest available local storage: NVMe, tmpfs, or any local mount.
 
 The `EnsureAdapter` call guarantees adapter files exist in this directory:
 
@@ -224,7 +228,7 @@ vLLM also has its own CPU memory LRU cache (`--max-cpu-loras`) for loaded adapte
 
 ### Routing
 
-Consistent hashing maps each adapter to a primary owner node. Under normal conditions, a 3-node cluster stores 3x the adapters of a single node, not 1x with redundant copies. When overflow protection kicks in, multiple nodes may store the same hot adapter (see below).
+Consistent hashing maps each request's hash key to a primary owner node. By default the key is the adapter name, so a 3-node cluster stores 3x the adapters of a single node instead of redundant copies. When overflow protection kicks in, multiple nodes may store the same hot adapter (see below).
 
 When a request arrives at the wrong node, it forwards to the owner. If the owner is down, the request is retried on the next peer in the ring. If both fail, the receiving node handles it locally (fetches the adapter itself). Forwarding adds a few milliseconds of overhead within a datacenter.
 
@@ -232,13 +236,13 @@ When a request arrives at the wrong node, it forwards to the owner. If the owner
 
 **Hash key.** The `hash_on` config controls what gets hashed to determine the owner node:
 
-| `hash_on`               | Hash key                                | Use case                                                                                                                  |
-| ----------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `model` (default)       | The `model` field from the request body | Route by adapter. Most common.                                                                                            |
-| `tenant`                | The `X-Tenant-ID` header                | Full tenant-node affinity. All of a tenant's adapters land on the same node.                                              |
-| `tenant/model`          | `{tenant}/{model}`                      | Tenant A and tenant B using the same adapter name route to different nodes. Falls back to model-only if no tenant header. |
-| `header:X-Region`       | Value of the `X-Region` header          | Route by any custom header (region, customer ID, environment, etc.).                                                      |
-| `header:X-Region/model` | `{header}/{model}`                      | Composite: route by header + adapter name. Falls back to model-only if header is missing.                                 |
+| `hash_on`             | Hash key                                | Use case                                                                                                                                                                                                                                                                                                   |
+| --------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model` (default)     | The `model` field from the request body | Route by adapter name. Most common for LoRA workloads.                                                                                                                                                                                                                                                     |
+| `tenant`              | The `X-Tenant-ID` header                | Full tenant-node affinity. All of a tenant's adapters land on the same node.                                                                                                                                                                                                                               |
+| `tenant/model`        | `{tenant}/{model}`                      | Tenant A and tenant B using the same adapter name route to different nodes. Falls back to model-only if no tenant header.                                                                                                                                                                                  |
+| `header:<name>`       | Value of the named header               | Route by any request header. Use `header:X-Session-ID` to pin conversations to a node for prefix cache reuse ([example](examples/session-affinity.yaml)), or `header:X-Document-ID` for RAG context affinity ([example](examples/document-routing.yaml)). Works for base model and adapter requests alike. |
+| `header:<name>/model` | `{header}/{model}`                      | Composite: route by header + adapter name. Falls back to model-only if the header is missing.                                                                                                                                                                                                              |
 
 **Peer discovery.** Three modes for how nodes find each other:
 
